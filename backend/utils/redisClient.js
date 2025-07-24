@@ -223,7 +223,30 @@ class RedisClient {
       throw error;
     }
   }
-
+  async scanKeys(pattern) {
+    if (!this.isConnected) {
+      await this.connect();
+    }
+  
+    if (this.useMock) {
+      const allKeys = [...this.client.store.keys()];
+      return allKeys.filter(key => new RegExp(pattern.replace('*', '.*')).test(key));
+    }
+  
+    const keys = [];
+    let cursor = '0';
+  
+    do {
+      const { cursor: nextCursor, keys: batchKeys } = await this.client.scan(cursor, {
+        MATCH: pattern,
+        COUNT: 100
+      });
+      cursor = nextCursor;
+      keys.push(...batchKeys);
+    } while (cursor !== '0');
+  
+    return keys;
+  }
   async del(key) {
     try {
       if (!this.isConnected) {
