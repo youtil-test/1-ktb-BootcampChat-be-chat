@@ -4,7 +4,9 @@ require('dotenv').config();
 // 기본 키와 솔트 (개발 환경용)
 const DEFAULT_ENCRYPTION_KEY = 'a'.repeat(64); // 32바이트를 hex로 표현
 const DEFAULT_PASSWORD_SALT = 'b'.repeat(32); // 16바이트를 hex로 표현
-
+const redisClusterNodes = process.env.REDIS_CLUSTER_NODES
+  ? process.env.REDIS_CLUSTER_NODES.split(',').map(n => n.trim())
+  : [];
 module.exports = {
   mongoURI: process.env.MONGO_URI,
   jwtSecret: process.env.JWT_SECRET,
@@ -14,4 +16,7 @@ module.exports = {
   redisPort: process.env.REDIS_PORT,
   openaiApiKey: process.env.OPENAI_API_KEY,
   vectorDbEndpoint: process.env.VECTOR_DB_ENDPOINT,
+  redisPubHost : process.env.REDIS_PUB_HOST,
+  redisPubPort : process.env.REDIS_PUB_PORT,
+  redisClusterNodes
 };

@@ -1,4 +1,4 @@
-const { redisClient } = require('../utils/redisClient');
+const { redisMaster, getReadRedis } = require('../utils/redisClient');
 const crypto = require('crypto');
 
 class SessionService {
@@ -46,9 +46,9 @@ class SessionService {
       }
 
       if (ttl) {
-        await redisClient.setEx(key, ttl, jsonString);
+        await redisMaster.set(key, jsonString, 'EX', ttl);
       } else {
-        await redisClient.set(key, jsonString);
+        await redisMaster.set(key, jsonString);
       }
       return true;
     } catch (error) {
@@ -60,7 +60,7 @@ class SessionService {
   // Redis에서 데이터를 가져와서 JSON으로 파싱
   static async getJson(key) {
     try {
-      const value = await redisClient.get(key);
+      const value = await getReadRedis().get(key);
       return this.safeParse(value);
     } catch (error) {
       console.error('Redis getJson error:', error);
@@ -99,9 +99,9 @@ class SessionService {
       }
 
       // 세션 ID 매핑 저장 - 문자열 값은 직접 저장
-      await redisClient.setEx(sessionIdKey, this.SESSION_TTL, userId.toString());
-      await redisClient.setEx(userSessionsKey, this.SESSION_TTL, sessionId);
-      await redisClient.setEx(activeSessionKey, this.SESSION_TTL, sessionId);
+      await redisMaster.set(sessionIdKey, this.SESSION_TTL, userId.toString());
+      await redisMaster.set(userSessionsKey, this.SESSION_TTL, sessionId);
+      await redisMaster.set(activeSessionKey, this.SESSION_TTL, sessionId);
 
       return {
         sessionId,
@@ -124,28 +124,58 @@ class SessionService {
           message: '유효하지 않은 세션 파라미터'
         };
       }
-
-      // 활성 세션 확인
+  
+      const sessionKey = this.getSessionKey(userId);
       const activeSessionKey = this.getActiveSessionKey(userId);
-      const activeSessionId = await redisClient.get(activeSessionKey);
-
-      if (!activeSessionId || activeSessionId !== sessionId) {
-        console.log('Session validation failed:', {
+      const sessionIdKey = this.getSessionIdKey(sessionId);
+      const userSessionsKey = this.getUserSessionsKey(userId);
+  
+      // 1차 시도: activeSessionKey 확인
+      let activeSessionId = await getReadRedis().get(activeSessionKey);
+  
+      // ✅ Redis 초기화 등으로 세션이 통째로 유실된 경우 복구 처리
+      if (!activeSessionId) {
+        // 강제 복구: 클라이언트의 sessionId를 기준으로 모든 키 복구
+        const now = Date.now();
+        const sessionData = {
           userId,
           sessionId,
-          activeSessionId
-        });
+          createdAt: now,
+          lastActivity: now,
+          metadata: {
+            userAgent: '',
+            ipAddress: '',
+            deviceInfo: '',
+            recovered: true
+          }
+        };
+  
+        await Promise.all([
+          redisMaster.set(sessionKey, JSON.stringify(sessionData), 'EX', this.SESSION_TTL),
+          redisMaster.set(sessionIdKey, userId.toString(), 'EX', this.SESSION_TTL),
+          redisMaster.set(userSessionsKey, sessionId, 'EX', this.SESSION_TTL),
+          redisMaster.set(activeSessionKey, sessionId, 'EX', this.SESSION_TTL),
+        ]);
+  
+        console.warn(`[Recover] 세션 복구 완료: userId=${userId}`);
+        return {
+          isValid: true,
+          recovered: true,
+          session: sessionData
+        };
+      }
+  
+      // 2차 검증: 기존 방식
+      if (activeSessionId !== sessionId) {
         return {
           isValid: false,
           error: 'INVALID_SESSION',
           message: '다른 기기에서 로그인되어 현재 세션이 만료되었습니다.'
         };
       }
-
-      // 세션 데이터 검증
-      const sessionKey = this.getSessionKey(userId);
+  
+      // 세션 갱신
       const sessionData = await this.getJson(sessionKey);
-
       if (!sessionData) {
         return {
           isValid: false,
@@ -153,9 +183,8 @@ class SessionService {
           message: '세션을 찾을 수 없습니다.'
         };
       }
-
-      // 세션 만료 시간 검증
-      const SESSION_TIMEOUT = 24 * 60 * 60 * 1000; // 24시간
+  
+      const SESSION_TIMEOUT = 24 * 60 * 60 * 1000;
       if (Date.now() - sessionData.lastActivity > SESSION_TIMEOUT) {
         await this.removeSession(userId);
         return {
@@ -164,32 +193,20 @@ class SessionService {
           message: '세션이 만료되었습니다.'
         };
       }
-
-      // 세션 데이터 갱신
+  
       sessionData.lastActivity = Date.now();
-      
-      // 갱신된 세션 데이터 저장
-      const updated = await this.setJson(sessionKey, sessionData, this.SESSION_TTL);
-      if (!updated) {
-        return {
-          isValid: false,
-          error: 'UPDATE_FAILED',
-          message: '세션 갱신에 실패했습니다.'
-        };
-      }
-
-      // 관련 키들의 만료 시간 갱신
+      await this.setJson(sessionKey, sessionData, this.SESSION_TTL);
       await Promise.all([
-        redisClient.expire(activeSessionKey, this.SESSION_TTL),
-        redisClient.expire(this.getUserSessionsKey(userId), this.SESSION_TTL),
-        redisClient.expire(this.getSessionIdKey(sessionId), this.SESSION_TTL)
+        redisMaster.expire(activeSessionKey, this.SESSION_TTL),
+        redisMaster.expire(userSessionsKey, this.SESSION_TTL),
+        redisMaster.expire(sessionIdKey, this.SESSION_TTL)
       ]);
-
+  
       return {
         isValid: true,
         session: sessionData
       };
-
+  
     } catch (error) {
       console.error('Session validation error:', error);
       return {
@@ -206,23 +223,23 @@ class SessionService {
       const activeSessionKey = this.getActiveSessionKey(userId);
 
       if (sessionId) {
-        const currentSessionId = await redisClient.get(userSessionsKey);
+        const currentSessionId = await getReadRedis().get(userSessionsKey);
         if (currentSessionId === sessionId) {
           await Promise.all([
-            redisClient.del(this.getSessionKey(userId)),
-            redisClient.del(this.getSessionIdKey(sessionId)),
-            redisClient.del(userSessionsKey),
-            redisClient.del(activeSessionKey)
+            redisMaster.del(this.getSessionKey(userId)),
+            redisMaster.del(this.getSessionIdKey(sessionId)),
+            redisMaster.del(userSessionsKey),
+            redisMaster.del(activeSessionKey)
           ]);
         }
       } else {
-        const storedSessionId = await redisClient.get(userSessionsKey);
+        const storedSessionId = await getReadRedis().get(userSessionsKey);
         if (storedSessionId) {
           await Promise.all([
-            redisClient.del(this.getSessionKey(userId)),
-            redisClient.del(this.getSessionIdKey(storedSessionId)),
-            redisClient.del(userSessionsKey),
-            redisClient.del(activeSessionKey)
+            redisMaster.del(this.getSessionKey(userId)),
+            redisMaster.del(this.getSessionIdKey(storedSessionId)),
+            redisMaster.del(userSessionsKey),
+            redisMaster.del(activeSessionKey)
           ]);
         }
       }
@@ -236,17 +253,17 @@ class SessionService {
     try {
       const activeSessionKey = this.getActiveSessionKey(userId);
       const userSessionsKey = this.getUserSessionsKey(userId);
-      const sessionId = await redisClient.get(userSessionsKey);
+      const sessionId = await getReadRedis().get(userSessionsKey);
 
       const deletePromises = [
-        redisClient.del(activeSessionKey),
-        redisClient.del(userSessionsKey)
+        redisMaster.del(activeSessionKey),
+        redisMaster.del(userSessionsKey)
       ];
 
       if (sessionId) {
         deletePromises.push(
-          redisClient.del(this.getSessionKey(userId)),
-          redisClient.del(this.getSessionIdKey(sessionId))
+          redisMaster.del(this.getSessionKey(userId)),
+          redisMaster.del(this.getSessionIdKey(sessionId))
         );
       }
 
@@ -289,9 +306,9 @@ class SessionService {
       if (sessionData.sessionId) {
         const sessionIdKey = this.getSessionIdKey(sessionData.sessionId);
         await Promise.all([
-          redisClient.expire(activeSessionKey, this.SESSION_TTL),
-          redisClient.expire(userSessionsKey, this.SESSION_TTL),
-          redisClient.expire(sessionIdKey, this.SESSION_TTL)
+          redisMaster.expire(activeSessionKey, this.SESSION_TTL),
+          redisMaster.expire(userSessionsKey, this.SESSION_TTL),
+          redisMaster.expire(sessionIdKey, this.SESSION_TTL)
         ]);
       }
 
@@ -311,7 +328,7 @@ class SessionService {
       }
 
       const activeSessionKey = this.getActiveSessionKey(userId);
-      const sessionId = await redisClient.get(activeSessionKey);
+      const sessionId = await getReadRedis().get(activeSessionKey);
 
       if (!sessionId) {
         return null;
@@ -321,7 +338,7 @@ class SessionService {
       const sessionData = await this.getJson(sessionKey);
 
       if (!sessionData) {
-        await redisClient.del(activeSessionKey);
+        await redisMaster.del(activeSessionKey);
         return null;
       }
 

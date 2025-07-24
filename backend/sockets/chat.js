@@ -5,7 +5,7 @@ const File = require('../models/File');
 const { pubClient,subClient } = require('../utils/redisClient');
 const jwt = require('jsonwebtoken');
 const { jwtSecret } = require('../config/keys');
-const { redisClient } = require('../utils/redisClient');
+const { redisMaster, getReadRedis } = require('../utils/redisClient');
 
 const SessionService = require('../services/sessionService');
 const {publishAIRequest} =require('../utils/kafkaProducer')
@@ -35,11 +35,16 @@ module.exports = function(io) {
   const loadMessages = async (socket, roomId, before, limit = BATCH_SIZE) => {
     const isInitialLoad = !before;
     const cacheKey = `chat:messages:${roomId}`;
+    const redis = getReadRedis(); // 슬레이브 중 하나 선택
   
     if (isInitialLoad) {
-      const cached = await redisClient.get(cacheKey);
+      const cached = await redis.get(cacheKey);
       if (cached) {
-        return cached;
+        try {
+          return JSON.parse(cached);
+        } catch (err) {
+          console.error('[Redis parse error in loadMessages]', err);
+        }
       }
     }
   
@@ -64,9 +69,8 @@ module.exports = function(io) {
       oldestTimestamp: resultMessages[0]?.timestamp || null
     };
   
-    // ✅ 단일 키 캐시
     if (isInitialLoad) {
-      await redisClient.set(cacheKey, JSON.stringify(response), { ttl: 60 });
+      await redisMaster.set(cacheKey, JSON.stringify(response), 'EX', 60);
     }
   
     return response;
@@ -204,49 +208,78 @@ module.exports = function(io) {
       next(new Error('Authentication failed'));
     }
   });
-  subClient.connect()
-    .then(() => {
-      subClient.pSubscribe('room:*', async (message, channel) => {
-        try {
-          const [, roomId] = channel.split(':');
-          const parsed = JSON.parse(message);
 
-          switch (parsed.type) {
-            case 'aiMessageStart':
-              io.to(roomId).emit('aiMessageStart', parsed.data);
-              break;
-            case 'aiMessageChunk':
-              io.to(roomId).emit('aiMessageChunk', parsed.data);
-              break;
-            case 'aiMessageComplete':
-              io.to(roomId).emit('aiMessageComplete', parsed.data);
-              break;
-            case 'aiMessageError':
-              io.to(roomId).emit('aiMessageError', parsed.data);
-              break;
-            case 'text':
-            case 'file':
-            case 'ai':
-            case 'system':
-              io.to(roomId).emit('message', parsed); // 일반 메시지
-              break;
-            default:
-              console.warn('Unknown message type:', parsed.type);
-          }
-
-          // logDebug('redis pubsub delivery', {
-          //   roomId,
-          //   sender: parsed.sender?.name,
-          //   messageId: parsed._id
-          // });
-        } catch (error) {
-          console.error('Redis pubsub message error:', error);
-        }
-      });
-    })
-    .catch(err => {
-      console.error('Redis subscriber connect failed:', err);
-    });
+  subClient.psubscribe('room:*', (err, count) => {
+    if (err) {
+      console.error('Pattern subscribe error:', err);
+    } else {
+      console.log(`Subscribed to ${count} pattern(s)`);
+    }
+  });
+  
+  subClient.on('pmessage', async (pattern, channel, message) => {
+    try {
+      const [, roomId] = channel.split(':');
+      const parsed = JSON.parse(message);
+  
+      switch (parsed.type) {
+        case 'aiMessageStart':
+          io.to(roomId).emit('aiMessageStart', parsed.data);
+          break;
+        case 'aiMessageChunk':
+          io.to(roomId).emit('aiMessageChunk', parsed.data);
+          break;
+        case 'aiMessageComplete':
+          const {
+            messageId,
+            content,
+            aiType,
+            timestamp,
+            isComplete,
+            query,
+            reactions
+          } = parsed.data;
+        
+          // DB 저장
+          const aiMessage = await Message.create({
+            room: roomId,
+            content,
+            type: 'ai',
+            aiType,
+            timestamp,
+            reactions: reactions || {},
+            metadata: {
+              query,
+              isComplete,
+              generationTime: Date.now() - new Date(timestamp),
+            }
+          });
+        
+          // 캐시 무효화
+          await redisMaster.del(`chat:messages:${roomId}`);
+        
+          // 클라이언트 전송
+          io.to(roomId).emit('aiMessageComplete', {
+            ...parsed.data,
+            _id: aiMessage._id
+          });
+          break;
+        case 'aiMessageError':
+          io.to(roomId).emit('aiMessageError', parsed.data);
+          break;
+        case 'text':
+        case 'file':
+        case 'ai':
+        case 'system':
+          io.to(roomId).emit('message', parsed);
+          break;
+        default:
+          console.warn('Unknown message type:', parsed.type);
+      }
+    } catch (error) {
+      console.error('Redis pubsub message error:', error);
+    }
+  });
   io.on('connection', (socket) => {
     // logDebug('socket connected', {
     //   socketId: socket.id,
@@ -597,12 +630,12 @@ module.exports = function(io) {
           type: message.type,
           room
         });
-        await redisClient.del(getMessageCacheKey(room)); // 메시지 목록 캐시 제거
+        await redisMaster.del(getMessageCacheKey(room)); // 메시지 목록 캐시 제거
 
         // 채팅방 참여자 목록 가져오기
         const participants = chatRoom.participants || [];
         for (const userId of participants) {
-          await redisClient.del(`chat:roomList:${userId}`);
+          await redisMaster.del(`chat:roomList:${userId}`);
         }
       } catch (error) {
         console.error('Message handling error:', error);
