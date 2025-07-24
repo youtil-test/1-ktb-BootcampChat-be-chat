@@ -8,6 +8,7 @@ const { jwtSecret } = require('../config/keys');
 const redisClient = require('../utils/redisClient');
 const SessionService = require('../services/sessionService');
 const aiService = require('../services/aiService');
+const {publishAIRequest} =require('../utils/kafkaProducer')
 
 module.exports = function(io) {
   const connectedUsers = new Map();
@@ -603,7 +604,18 @@ module.exports = function(io) {
         if (aiMentions.length > 0) {
           for (const ai of aiMentions) {
             const query = content.replace(new RegExp(`@${ai}\\b`, 'g'), '').trim();
-            await handleAIResponse(io, room, ai, query);
+        
+            // Kafka를 통해 메시지 발행
+            await publishAIRequest({
+              roomId: room,
+              aiType: ai,
+              query,
+              user: {
+                id: socket.user.id,
+                name: socket.user.name,
+                profileImage: socket.user.profileImage
+              }
+            });
           }
         }
 

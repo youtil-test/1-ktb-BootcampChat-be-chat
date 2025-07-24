@@ -44,7 +44,7 @@ const run = async () => {
           type: 'aiMessageStart',
           data: { messageId, aiType, timestamp }
         }));
-
+        let accumulatedContent = ''; 
         // AI 응답 생성
         await aiService.generateResponse(query, aiType, {
             onStart: async () => {
@@ -53,19 +53,21 @@ const run = async () => {
                     data: { messageId, aiType, timestamp }
                 }));
                 },
-            onChunk: async (chunk) => {
-                await pubClient.publish(`room:${roomId}`, JSON.stringify({
-                type: 'aiMessageChunk',
-                data: {
-                    messageId,
-                    currentChunk: chunk.currentChunk,
-                    fullContent: chunk.fullContent,
-                    isCodeBlock: chunk.isCodeBlock,
-                    aiType,
-                    timestamp: new Date(),
-                },
-                }));
-            },
+                onChunk: async (chunk) => {
+                    accumulatedContent += chunk.currentChunk || '';
+                  
+                    await pubClient.publish(`room:${roomId}`, JSON.stringify({
+                      type: 'aiMessageChunk',
+                      data: {
+                        messageId,
+                        currentChunk: chunk.currentChunk,
+                        fullContent: accumulatedContent, // 🔥 이게 지금 undefined였던 원인
+                        isCodeBlock: chunk.isCodeBlock,
+                        aiType,
+                        timestamp: new Date(),
+                      },
+                    }));
+                  },
           onComplete: async (finalContent) => {
             await pubClient.publish(`room:${roomId}`, JSON.stringify({
               type: 'aiMessageComplete',

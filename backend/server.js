@@ -7,7 +7,8 @@ const socketIO = require('socket.io');
 const path = require('path');
 const { router: roomsRouter, initializeSocket } = require('./routes/api/rooms');
 const routes = require('./routes');
-
+const { initProducer } = require('./utils/kafkaProducer');
+const { run } = require('./worker/aiConsumerWorker');
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 8081;
@@ -99,6 +100,18 @@ app.use((err, req, res, next) => {
     ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
   });
 });
+(async () => {
+  try {
+    await initProducer();
+    console.log('Kafka producer connected.');
+
+    run()
+      .then(() => console.log('Kafka consumer running.'))
+      .catch(err => console.error('Kafka consumer start failed:', err));
+  } catch (err) {
+    console.error('Kafka producer init failed:', err);
+  }
+})();
 
 // 서버 시작
 mongoose.connect(process.env.MONGO_URI)
@@ -114,5 +127,5 @@ mongoose.connect(process.env.MONGO_URI)
     console.error('Server startup error:', err);
     process.exit(1);
   });
-
+  
 module.exports = { app, server };
