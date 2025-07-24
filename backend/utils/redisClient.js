@@ -3,9 +3,11 @@ const Redis = require('redis');
 const { redisHost, redisPort } = require('../config/keys');
 const { createClient }=require('redis');
 
-const redisClient = createClient();
-const pubClient = createClient();
-const subClient = createClient();
+
+const redisUrl = `redis://${redisHost}:${redisPort}`;
+const redisClient = createClient({ url: redisUrl });
+const pubClient = createClient({ url: redisUrl });
+const subClient = createClient({ url: redisUrl });
 
 async function connectAll() {
   if (!redisClient.isOpen) await redisClient.connect();
