@@ -2,6 +2,7 @@ const Message = require('../models/Message');
 const Room = require('../models/Room');
 const User = require('../models/User');
 const File = require('../models/File');
+const { pubClient,subClient } = require('../utils/redisClient');
 const jwt = require('jsonwebtoken');
 const { jwtSecret } = require('../config/keys');
 const redisClient = require('../utils/redisClient');
@@ -243,7 +244,49 @@ module.exports = function(io) {
       next(new Error('Authentication failed'));
     }
   });
-  
+  subClient.connect()
+    .then(() => {
+      subClient.pSubscribe('room:*', async (message, channel) => {
+        try {
+          const [, roomId] = channel.split(':');
+          const parsed = JSON.parse(message);
+
+          switch (parsed.type) {
+            case 'aiMessageStart':
+              io.to(roomId).emit('aiMessageStart', parsed.data);
+              break;
+            case 'aiMessageChunk':
+              io.to(roomId).emit('aiMessageChunk', parsed.data);
+              break;
+            case 'aiMessageComplete':
+              io.to(roomId).emit('aiMessageComplete', parsed.data);
+              break;
+            case 'aiMessageError':
+              io.to(roomId).emit('aiMessageError', parsed.data);
+              break;
+            case 'text':
+            case 'file':
+            case 'ai':
+            case 'system':
+              io.to(roomId).emit('message', parsed); // 일반 메시지
+              break;
+            default:
+              console.warn('Unknown message type:', parsed.type);
+          }
+
+          logDebug('redis pubsub delivery', {
+            roomId,
+            sender: parsed.sender?.name,
+            messageId: parsed._id
+          });
+        } catch (error) {
+          console.error('Redis pubsub message error:', error);
+        }
+      });
+    })
+    .catch(err => {
+      console.error('Redis subscriber connect failed:', err);
+    });
   io.on('connection', (socket) => {
     logDebug('socket connected', {
       socketId: socket.id,
@@ -545,8 +588,17 @@ module.exports = function(io) {
           { path: 'file', select: 'filename originalname mimetype size' }
         ]);
 
-        io.to(room).emit('message', message);
-
+        // io.to(room).emit('message', message);
+        await pubClient.publish(`room:${room}`, JSON.stringify({
+          ...message.toObject(),
+          room,
+          sender: {
+            _id: socket.user.id,
+            name: socket.user.name,
+            email: socket.user.email,
+            profileImage: socket.user.profileImage
+          }
+        }));
         // AI 멘션이 있는 경우 AI 응답 생성
         if (aiMentions.length > 0) {
           for (const ai of aiMentions) {
@@ -862,12 +914,19 @@ module.exports = function(io) {
     });
 
     // 초기 상태 전송
-    io.to(room).emit('aiMessageStart', {
-      messageId,
-      aiType: aiName,
-      timestamp
-    });
-
+    // io.to(room).emit('aiMessageStart', {
+    //   messageId,
+    //   aiType: aiName,
+    //   timestamp
+    // });
+    await pubClient.publish(`room:${room}`, JSON.stringify({
+      type: 'aiMessageStart',
+      data: {
+        messageId,
+        aiType: aiName,
+        timestamp
+      }
+    }));
     try {
       // AI 응답 생성 및 스트리밍
       await aiService.generateResponse(query, aiName, {
@@ -885,16 +944,27 @@ module.exports = function(io) {
             session.content = accumulatedContent;
             session.lastUpdate = Date.now();
           }
-
-          io.to(room).emit('aiMessageChunk', {
-            messageId,
-            currentChunk: chunk.currentChunk,
-            fullContent: accumulatedContent,
-            isCodeBlock: chunk.isCodeBlock,
-            timestamp: new Date(),
-            aiType: aiName,
-            isComplete: false
-          });
+          await pubClient.publish(`room:${room}`, JSON.stringify({
+            type: 'aiMessageChunk',
+            data: {
+              messageId,
+              currentChunk: chunk.currentChunk,
+              fullContent: accumulatedContent,
+              isCodeBlock: chunk.isCodeBlock,
+              timestamp: new Date(),
+              aiType: aiName,
+              isComplete: false
+            }
+          }));
+          // io.to(room).emit('aiMessageChunk', {
+          //   messageId,
+          //   currentChunk: chunk.currentChunk,
+          //   fullContent: accumulatedContent,
+          //   isCodeBlock: chunk.isCodeBlock,
+          //   timestamp: new Date(),
+          //   aiType: aiName,
+          //   isComplete: false
+          // });
         },
         onComplete: async (finalContent) => {
           // 스트리밍 세션 정리
@@ -917,17 +987,29 @@ module.exports = function(io) {
           });
 
           // 완료 메시지 전송
-          io.to(room).emit('aiMessageComplete', {
-            messageId,
-            _id: aiMessage._id,
-            content: finalContent.content,
-            aiType: aiName,
-            timestamp: new Date(),
-            isComplete: true,
-            query,
-            reactions: {}
-          });
-
+          // io.to(room).emit('aiMessageComplete', {
+          //   messageId,
+          //   _id: aiMessage._id,
+          //   content: finalContent.content,
+          //   aiType: aiName,
+          //   timestamp: new Date(),
+          //   isComplete: true,
+          //   query,
+          //   reactions: {}
+          // });
+          await pubClient.publish(`room:${room}`, JSON.stringify({
+            type: 'aiMessageComplete',
+            data: {
+              messageId,
+              _id: aiMessage._id,
+              content: finalContent.content,
+              aiType: aiName,
+              timestamp: new Date(),
+              isComplete: true,
+              query,
+              reactions: {}
+            }
+          }));
           logDebug('AI response completed', {
             messageId,
             aiType: aiName,
@@ -935,16 +1017,23 @@ module.exports = function(io) {
             generationTime: Date.now() - timestamp
           });
         },
-        onError: (error) => {
+        onError: async (error) => {
           streamingSessions.delete(messageId);
           console.error('AI response error:', error);
           
-          io.to(room).emit('aiMessageError', {
-            messageId,
-            error: error.message || 'AI 응답 생성 중 오류가 발생했습니다.',
-            aiType: aiName
-          });
-
+          // io.to(room).emit('aiMessageError', {
+          //   messageId,
+          //   error: error.message || 'AI 응답 생성 중 오류가 발생했습니다.',
+          //   aiType: aiName
+          // });
+          await pubClient.publish(`room:${room}`, JSON.stringify({
+            type: 'aiMessageError',
+            data: {
+              messageId,
+              error: error.message || 'AI 응답 생성 중 오류가 발생했습니다.',
+              aiType: aiName
+            }
+          }));
           logDebug('AI response error', {
             messageId,
             aiType: aiName,
