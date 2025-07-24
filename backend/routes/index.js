@@ -2,10 +2,10 @@ const express = require('express');
 const router = express.Router();
 
 // Import route modules
-const authRoutes = require('./api/auth');
-const userRoutes = require('./api/users');
+// const authRoutes = require('./api/auth');
+// const userRoutes = require('./api/users');
 const { router: roomsRouter } = require('./api/rooms');
-const fileRoutes = require('./api/files');
+// const fileRoutes = require('./api/files');
 
 // API documentation route
 router.get('/', (req, res) => {
@@ -33,9 +33,9 @@ router.get('/', (req, res) => {
 });
 
 // Mount routes
-router.use('/auth', authRoutes);
-router.use('/users', userRoutes);
+// router.use('/auth', authRoutes);
+// router.use('/users', userRoutes);
 router.use('/rooms', roomsRouter);  // roomsRouter로 변경
-router.use('/files', fileRoutes);
+// router.use('/files', fileRoutes);
 
 module.exports = router;
