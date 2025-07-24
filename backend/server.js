@@ -8,7 +8,7 @@ const path = require('path');
 const { router: roomsRouter, initializeSocket } = require('./routes/api/rooms');
 const routes = require('./routes');
 const { initProducer } = require('./utils/kafkaProducer');
-const { run } = require('./worker/aiConsumerWorker');
+// const { run } = require('./worker/aiConsumerWorker');
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 8081;
@@ -105,9 +105,9 @@ app.use((err, req, res, next) => {
     await initProducer();
     console.log('Kafka producer connected.');
 
-    run()
-      .then(() => console.log('Kafka consumer running.'))
-      .catch(err => console.error('Kafka consumer start failed:', err));
+    // run()
+    //   .then(() => console.log('Kafka consumer running.'))
+    //   .catch(err => console.error('Kafka consumer start failed:', err));
   } catch (err) {
     console.error('Kafka producer init failed:', err);
   }
