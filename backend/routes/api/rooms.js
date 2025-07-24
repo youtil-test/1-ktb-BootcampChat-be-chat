@@ -201,22 +201,28 @@ router.post('/', auth, async (req, res) => {
     });
 
     const savedRoom = await newRoom.save();
-    const populatedRoom = await Room.findById(savedRoom._id)
-      .populate('creator', 'name email')
-      .populate('participants', 'name email');
+    const room = await Room.findById(savedRoom._id).lean();
+    const [creator, participants] = await Promise.all([
+      User.findById(room.creator).select('name email').lean(),
+      User.find({ _id: { $in: room.participants } }).select('name email').lean()
+    ]);
+
+    room.creator = creator;
+    room.participants = participants;
     
     // Socket.IO를 통해 새 채팅방 생성 알림
     if (io) {
       io.to('room-list').emit('roomCreated', {
-        ...populatedRoom.toObject(),
-        password: undefined
+        _id: room._id.toString(),
+        name: room.name,
+        createdAt: room.createdAt
       });
     }
     
     res.status(201).json({
       success: true,
       data: {
-        ...populatedRoom.toObject(),
+        ...room,
         password: undefined
       }
     });
