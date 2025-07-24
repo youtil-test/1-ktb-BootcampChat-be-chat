@@ -15,7 +15,7 @@ jobs:
 
       - name: Create .env file from ENV_DEV secret
         run: |
-          echo "${{ secrets.ENV_DEV }}" > .env
+          echo "${{ secrets.ENV_PROD }}" > .env
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -25,5 +25,5 @@ jobs:
 
       - name: Build and push Docker image
         run: |
-          docker build -t 1-load-test-be:latest .
-          docker push 1-load-test-be:latest
+          docker build -t 1-load-test-be-chat:latest .
+          docker push 1-load-test-be-chat:latest
