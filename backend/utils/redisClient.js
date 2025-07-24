@@ -1,7 +1,21 @@
 // backend/utils/redisClient.js
 const Redis = require('redis');
 const { redisHost, redisPort } = require('../config/keys');
+const { createClient }=require('redis');
 
+const redisClient = createClient();
+const pubClient = createClient();
+const subClient = createClient();
+
+async function connectAll() {
+  if (!redisClient.isOpen) await redisClient.connect();
+  if (!pubClient.isOpen) await pubClient.connect();
+  if (!subClient.isOpen) await subClient.connect();
+}
+
+connectAll().catch(err => {
+  console.error('❌ Redis connection error:', err);
+});
 class MockRedisClient {
   constructor() {
     this.store = new Map();
@@ -246,5 +260,5 @@ class RedisClient {
   }
 }
 
-const redisClient = new RedisClient();
-module.exports = redisClient;
+
+module.exports = { redisClient: new RedisClient(), pubClient, subClient };
