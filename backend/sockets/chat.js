@@ -5,10 +5,11 @@ const File = require('../models/File');
 const { pubClient,subClient } = require('../utils/redisClient');
 const jwt = require('jsonwebtoken');
 const { jwtSecret } = require('../config/keys');
-const redisClient = require('../utils/redisClient');
-const SessionService = require('../services/sessionService');
-const aiService = require('../services/aiService');
+const { redisClient } = require('../utils/redisClient');
 
+const SessionService = require('../services/sessionService');
+const {publishAIRequest} =require('../utils/kafkaProducer')
+const { getCachedParticipants, setCachedParticipants, invalidateParticipantsCache } = require('../utils/cache');
 module.exports = function(io) {
   const connectedUsers = new Map();
   const streamingSessions = new Map();
@@ -21,7 +22,7 @@ module.exports = function(io) {
   const MESSAGE_LOAD_TIMEOUT = 10000; // 메시지 로드 타임아웃 (10초)
   const RETRY_DELAY = 2000; // 재시도 간격 (2초)
   const DUPLICATE_LOGIN_TIMEOUT = 10000; // 중복 로그인 타임아웃 (10초)
-
+  const getMessageCacheKey = (roomId) => `chat:messages:${roomId}`;
   // 로깅 유틸리티 함수
   const logDebug = (action, data) => {
     console.debug(`[Socket.IO] ${action}:`, {
@@ -32,84 +33,43 @@ module.exports = function(io) {
 
   // 메시지 일괄 로드 함수 개선
   const loadMessages = async (socket, roomId, before, limit = BATCH_SIZE) => {
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => {
-        reject(new Error('Message loading timed out'));
-      }, MESSAGE_LOAD_TIMEOUT);
-    });
-
-    try {
-      // 쿼리 구성
-      const query = { room: roomId };
-      if (before) {
-        query.timestamp = { $lt: new Date(before) };
+    const isInitialLoad = !before;
+    const cacheKey = `chat:messages:${roomId}`;
+  
+    if (isInitialLoad) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached) {
+        return cached;
       }
-
-      // 메시지 로드 with profileImage
-      const messages = await Promise.race([
-        Message.find(query)
-          .populate('sender', 'name email profileImage')
-          .populate({
-            path: 'file',
-            select: 'filename originalname mimetype size'
-          })
-          .sort({ timestamp: -1 })
-          .limit(limit + 1)
-          .lean(),
-        timeoutPromise
-      ]);
-
-      // 결과 처리
-      const hasMore = messages.length > limit;
-      const resultMessages = messages.slice(0, limit);
-      const sortedMessages = resultMessages.sort((a, b) => 
-        new Date(a.timestamp) - new Date(b.timestamp)
-      );
-
-      // 읽음 상태 비동기 업데이트
-      if (sortedMessages.length > 0 && socket.user) {
-        const messageIds = sortedMessages.map(msg => msg._id);
-        Message.updateMany(
-          {
-            _id: { $in: messageIds },
-            'readers.userId': { $ne: socket.user.id }
-          },
-          {
-            $push: {
-              readers: {
-                userId: socket.user.id,
-                readAt: new Date()
-              }
-            }
-          }
-        ).exec().catch(error => {
-          console.error('Read status update error:', error);
-        });
-      }
-
-      return {
-        messages: sortedMessages,
-        hasMore,
-        oldestTimestamp: sortedMessages[0]?.timestamp || null
-      };
-    } catch (error) {
-      if (error.message === 'Message loading timed out') {
-        logDebug('message load timeout', {
-          roomId,
-          before,
-          limit
-        });
-      } else {
-        console.error('Load messages error:', {
-          error: error.message,
-          stack: error.stack,
-          roomId,
-          before,
-          limit
-        });
-      }
-      throw error;
     }
+  
+    const query = { room: roomId };
+    if (before) query.timestamp = { $lt: new Date(before) };
+  
+    const messages = await Message.find(query)
+      .populate('sender', 'name email profileImage')
+      .populate({ path: 'file', select: 'filename originalname mimetype size' })
+      .sort({ timestamp: -1 })
+      .limit(limit + 1)
+      .lean();
+  
+    const hasMore = messages.length > limit;
+    const resultMessages = messages.slice(0, limit).sort((a, b) =>
+      new Date(a.timestamp) - new Date(b.timestamp)
+    );
+  
+    const response = {
+      messages: resultMessages,
+      hasMore,
+      oldestTimestamp: resultMessages[0]?.timestamp || null
+    };
+  
+    // ✅ 단일 키 캐시
+    if (isInitialLoad) {
+      await redisClient.set(cacheKey, JSON.stringify(response), { ttl: 60 });
+    }
+  
+    return response;
   };
 
   // 재시도 로직을 포함한 메시지 로드 함수
@@ -274,11 +234,11 @@ module.exports = function(io) {
               console.warn('Unknown message type:', parsed.type);
           }
 
-          logDebug('redis pubsub delivery', {
-            roomId,
-            sender: parsed.sender?.name,
-            messageId: parsed._id
-          });
+          // logDebug('redis pubsub delivery', {
+          //   roomId,
+          //   sender: parsed.sender?.name,
+          //   messageId: parsed._id
+          // });
         } catch (error) {
           console.error('Redis pubsub message error:', error);
         }
@@ -288,11 +248,11 @@ module.exports = function(io) {
       console.error('Redis subscriber connect failed:', err);
     });
   io.on('connection', (socket) => {
-    logDebug('socket connected', {
-      socketId: socket.id,
-      userId: socket.user?.id,
-      userName: socket.user?.name
-    });
+    // logDebug('socket connected', {
+    //   socketId: socket.id,
+    //   userId: socket.user?.id,
+    //   userName: socket.user?.name
+    // });
 
     if (socket.user) {
       // 이전 연결이 있는지 확인
@@ -414,14 +374,26 @@ module.exports = function(io) {
         const room = await Room.findByIdAndUpdate(
           roomId,
           { $addToSet: { participants: socket.user.id } },
-          { 
+          {
             new: true,
-            runValidators: true 
+            runValidators: true
           }
-        ).populate('participants', 'name email profileImage');
-
+        );
+        
         if (!room) {
           throw new Error('채팅방을 찾을 수 없습니다.');
+        }
+        // await invalidateParticipantsCache(roomId);
+        // 참가자 목록 캐시 조회 시도
+    
+        let participants = await getCachedParticipants(roomId);
+    
+
+        if (!participants) {
+          console.log("cache miss");
+          const fullRoom = await Room.findById(roomId).populate('participants', 'name email profileImage');
+          participants = fullRoom?.participants || [];
+          await setCachedParticipants(roomId, participants);
         }
 
         socket.join(roomId);
@@ -456,7 +428,7 @@ module.exports = function(io) {
         // 이벤트 발송
         socket.emit('joinRoomSuccess', {
           roomId,
-          participants: room.participants,
+          participants,
           messages,
           hasMore,
           oldestTimestamp,
@@ -464,7 +436,7 @@ module.exports = function(io) {
         });
 
         io.to(roomId).emit('message', joinMessage);
-        io.to(roomId).emit('participantsUpdate', room.participants);
+        io.to(roomId).emit('participantsUpdate', participants);
 
         logDebug('user joined room', {
           userId: socket.user.id,
@@ -587,7 +559,7 @@ module.exports = function(io) {
           { path: 'sender', select: 'name email profileImage' },
           { path: 'file', select: 'filename originalname mimetype size' }
         ]);
-
+        
         // io.to(room).emit('message', message);
         await pubClient.publish(`room:${room}`, JSON.stringify({
           ...message.toObject(),
@@ -603,7 +575,18 @@ module.exports = function(io) {
         if (aiMentions.length > 0) {
           for (const ai of aiMentions) {
             const query = content.replace(new RegExp(`@${ai}\\b`, 'g'), '').trim();
-            await handleAIResponse(io, room, ai, query);
+        
+            // Kafka를 통해 메시지 발행
+            await publishAIRequest({
+              roomId: room,
+              aiType: ai,
+              query,
+              user: {
+                id: socket.user.id,
+                name: socket.user.name,
+                profileImage: socket.user.profileImage
+              }
+            });
           }
         }
 
@@ -614,7 +597,13 @@ module.exports = function(io) {
           type: message.type,
           room
         });
+        await redisClient.del(getMessageCacheKey(room)); // 메시지 목록 캐시 제거
 
+        // 채팅방 참여자 목록 가져오기
+        const participants = chatRoom.participants || [];
+        for (const userId of participants) {
+          await redisClient.del(`chat:roomList:${userId}`);
+        }
       } catch (error) {
         console.error('Message handling error:', error);
         socket.emit('error', {
@@ -927,136 +916,137 @@ module.exports = function(io) {
         timestamp
       }
     }));
-    try {
-      // AI 응답 생성 및 스트리밍
-      await aiService.generateResponse(query, aiName, {
-        onStart: () => {
-          logDebug('AI generation started', {
-            messageId,
-            aiType: aiName
-          });
-        },
-        onChunk: async (chunk) => {
-          accumulatedContent += chunk.currentChunk || '';
-          
-          const session = streamingSessions.get(messageId);
-          if (session) {
-            session.content = accumulatedContent;
-            session.lastUpdate = Date.now();
-          }
-          await pubClient.publish(`room:${room}`, JSON.stringify({
-            type: 'aiMessageChunk',
-            data: {
-              messageId,
-              currentChunk: chunk.currentChunk,
-              fullContent: accumulatedContent,
-              isCodeBlock: chunk.isCodeBlock,
-              timestamp: new Date(),
-              aiType: aiName,
-              isComplete: false
-            }
-          }));
-          // io.to(room).emit('aiMessageChunk', {
-          //   messageId,
-          //   currentChunk: chunk.currentChunk,
-          //   fullContent: accumulatedContent,
-          //   isCodeBlock: chunk.isCodeBlock,
-          //   timestamp: new Date(),
-          //   aiType: aiName,
-          //   isComplete: false
-          // });
-        },
-        onComplete: async (finalContent) => {
-          // 스트리밍 세션 정리
-          streamingSessions.delete(messageId);
 
-          // AI 메시지 저장
-          const aiMessage = await Message.create({
-            room,
-            content: finalContent.content,
-            type: 'ai',
-            aiType: aiName,
-            timestamp: new Date(),
-            reactions: {},
-            metadata: {
-              query,
-              generationTime: Date.now() - timestamp,
-              completionTokens: finalContent.completionTokens,
-              totalTokens: finalContent.totalTokens
-            }
-          });
-
-          // 완료 메시지 전송
-          // io.to(room).emit('aiMessageComplete', {
-          //   messageId,
-          //   _id: aiMessage._id,
-          //   content: finalContent.content,
-          //   aiType: aiName,
-          //   timestamp: new Date(),
-          //   isComplete: true,
-          //   query,
-          //   reactions: {}
-          // });
-          await pubClient.publish(`room:${room}`, JSON.stringify({
-            type: 'aiMessageComplete',
-            data: {
-              messageId,
-              _id: aiMessage._id,
-              content: finalContent.content,
-              aiType: aiName,
-              timestamp: new Date(),
-              isComplete: true,
-              query,
-              reactions: {}
-            }
-          }));
-          logDebug('AI response completed', {
-            messageId,
-            aiType: aiName,
-            contentLength: finalContent.content.length,
-            generationTime: Date.now() - timestamp
-          });
-        },
-        onError: async (error) => {
-          streamingSessions.delete(messageId);
-          console.error('AI response error:', error);
+    // try {
+    //   // AI 응답 생성 및 스트리밍
+    //   await aiService.generateResponse(query, aiName, {
+    //     onStart: () => {
+    //       logDebug('AI generation started', {
+    //         messageId,
+    //         aiType: aiName
+    //       });
+    //     },
+    //     onChunk: async (chunk) => {
+    //       accumulatedContent += chunk.currentChunk || '';
           
-          // io.to(room).emit('aiMessageError', {
-          //   messageId,
-          //   error: error.message || 'AI 응답 생성 중 오류가 발생했습니다.',
-          //   aiType: aiName
-          // });
-          await pubClient.publish(`room:${room}`, JSON.stringify({
-            type: 'aiMessageError',
-            data: {
-              messageId,
-              error: error.message || 'AI 응답 생성 중 오류가 발생했습니다.',
-              aiType: aiName
-            }
-          }));
-          logDebug('AI response error', {
-            messageId,
-            aiType: aiName,
-            error: error.message
-          });
-        }
-      });
-    } catch (error) {
-      streamingSessions.delete(messageId);
-      console.error('AI service error:', error);
+    //       const session = streamingSessions.get(messageId);
+    //       if (session) {
+    //         session.content = accumulatedContent;
+    //         session.lastUpdate = Date.now();
+    //       }
+    //       await pubClient.publish(`room:${room}`, JSON.stringify({
+    //         type: 'aiMessageChunk',
+    //         data: {
+    //           messageId,
+    //           currentChunk: chunk.currentChunk,
+    //           fullContent: accumulatedContent,
+    //           isCodeBlock: chunk.isCodeBlock,
+    //           timestamp: new Date(),
+    //           aiType: aiName,
+    //           isComplete: false
+    //         }
+    //       }));
+    //       // io.to(room).emit('aiMessageChunk', {
+    //       //   messageId,
+    //       //   currentChunk: chunk.currentChunk,
+    //       //   fullContent: accumulatedContent,
+    //       //   isCodeBlock: chunk.isCodeBlock,
+    //       //   timestamp: new Date(),
+    //       //   aiType: aiName,
+    //       //   isComplete: false
+    //       // });
+    //     },
+    //     onComplete: async (finalContent) => {
+    //       // 스트리밍 세션 정리
+    //       streamingSessions.delete(messageId);
+
+    //       // AI 메시지 저장
+    //       const aiMessage = await Message.create({
+    //         room,
+    //         content: finalContent.content,
+    //         type: 'ai',
+    //         aiType: aiName,
+    //         timestamp: new Date(),
+    //         reactions: {},
+    //         metadata: {
+    //           query,
+    //           generationTime: Date.now() - timestamp,
+    //           completionTokens: finalContent.completionTokens,
+    //           totalTokens: finalContent.totalTokens
+    //         }
+    //       });
+
+    //       // 완료 메시지 전송
+    //       // io.to(room).emit('aiMessageComplete', {
+    //       //   messageId,
+    //       //   _id: aiMessage._id,
+    //       //   content: finalContent.content,
+    //       //   aiType: aiName,
+    //       //   timestamp: new Date(),
+    //       //   isComplete: true,
+    //       //   query,
+    //       //   reactions: {}
+    //       // });
+    //       await pubClient.publish(`room:${room}`, JSON.stringify({
+    //         type: 'aiMessageComplete',
+    //         data: {
+    //           messageId,
+    //           _id: aiMessage._id,
+    //           content: finalContent.content,
+    //           aiType: aiName,
+    //           timestamp: new Date(),
+    //           isComplete: true,
+    //           query,
+    //           reactions: {}
+    //         }
+    //       }));
+    //       logDebug('AI response completed', {
+    //         messageId,
+    //         aiType: aiName,
+    //         contentLength: finalContent.content.length,
+    //         generationTime: Date.now() - timestamp
+    //       });
+    //     },
+    //     onError: async (error) => {
+    //       streamingSessions.delete(messageId);
+    //       console.error('AI response error:', error);
+          
+    //       // io.to(room).emit('aiMessageError', {
+    //       //   messageId,
+    //       //   error: error.message || 'AI 응답 생성 중 오류가 발생했습니다.',
+    //       //   aiType: aiName
+    //       // });
+    //       await pubClient.publish(`room:${room}`, JSON.stringify({
+    //         type: 'aiMessageError',
+    //         data: {
+    //           messageId,
+    //           error: error.message || 'AI 응답 생성 중 오류가 발생했습니다.',
+    //           aiType: aiName
+    //         }
+    //       }));
+    //       logDebug('AI response error', {
+    //         messageId,
+    //         aiType: aiName,
+    //         error: error.message
+    //       });
+    //     }
+    //   });
+    // } catch (error) {
+    //   streamingSessions.delete(messageId);
+    //   console.error('AI service error:', error);
       
-      io.to(room).emit('aiMessageError', {
-        messageId,
-        error: error.message || 'AI 서비스 오류가 발생했습니다.',
-        aiType: aiName
-      });
+    //   io.to(room).emit('aiMessageError', {
+    //     messageId,
+    //     error: error.message || 'AI 서비스 오류가 발생했습니다.',
+    //     aiType: aiName
+    //   });
 
-      logDebug('AI service error', {
-        messageId,
-        aiType: aiName,
-        error: error.message
-      });
-    }
+    //   logDebug('AI service error', {
+    //     messageId,
+    //     aiType: aiName,
+    //     error: error.message
+    //   });
+    // }
   }
 
   return io;
