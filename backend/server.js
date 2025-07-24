@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 8081;
 
 // trust proxy 설정 추가
 app.set('trust proxy', 1);
-
+//2
 // CORS 설정
 const corsOptions = {
   origin: [
@@ -28,7 +28,8 @@ const corsOptions = {
     'https://localhost:3001',
     'https://localhost:3002',
     'http://0.0.0.0:3000',
-    'https://0.0.0.0:3000'
+    'https://0.0.0.0:3000',
+    'https://goorm-ktb-001.goorm.team'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],

@@ -14,7 +14,7 @@ async function connectAll() {
   if (!pubClient.isOpen) await pubClient.connect();
   if (!subClient.isOpen) await subClient.connect();
 }
-
+//3213
 connectAll().catch(err => {
   console.error('❌ Redis connection error:', err);
 });
