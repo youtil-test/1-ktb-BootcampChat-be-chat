@@ -99,9 +99,9 @@ class SessionService {
       }
 
       // 세션 ID 매핑 저장 - 문자열 값은 직접 저장
-      await redisMaster.set(sessionIdKey, this.SESSION_TTL, userId.toString());
-      await redisMaster.set(userSessionsKey, this.SESSION_TTL, sessionId);
-      await redisMaster.set(activeSessionKey, this.SESSION_TTL, sessionId);
+      await redisMaster.set(sessionIdKey, userId.toString(), 'EX', this.SESSION_TTL);
+      await redisMaster.set(userSessionsKey, sessionId, 'EX', this.SESSION_TTL);
+      await redisMaster.set(activeSessionKey, sessionId, 'EX', this.SESSION_TTL);
 
       return {
         sessionId,
@@ -167,10 +167,15 @@ class SessionService {
   
       // 2차 검증: 기존 방식
       if (activeSessionId !== sessionId) {
+        // 기존 세션과 불일치하더라도 새로 덮어씌우게 유도
+        console.warn(`[Override] 기존 세션(${activeSessionId})을 새 세션(${sessionId})으로 대체합니다`);
+        
+        // 복구 및 덮어쓰기 로직 실행
+        await this.createSession(userId, { recoveredFrom: activeSessionId });
         return {
-          isValid: false,
-          error: 'INVALID_SESSION',
-          message: '다른 기기에서 로그인되어 현재 세션이 만료되었습니다.'
+          isValid: true,
+          replaced: true,
+          session: await this.getJson(this.getSessionKey(userId))
         };
       }
   
